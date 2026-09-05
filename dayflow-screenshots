@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+Organize ~/Pictures/screenshot-*.png into an indexed folder.
+Uses the dayflow OpenRouter config and vision model (default gemma-4-31b-it)
+to caption/rename screenshots one image per request, then writes index.md.
+"""
+import base64
+import json
+import os
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+from PIL import Image
+import requests
+
+CONFIG = Path.home() / ".config" / "dayflow" / "config.json"
+SRC_DIR = Path.home() / "Pictures"
+DST_DIR = Path.home() / "Pictures" / "Screenshots"
+PROMPT = (
+    "Describe the main content of this screenshot in 3-6 words. "
+    "Focus on the app or activity shown. Reply with ONLY the caption in "
+    "snake_case, no punctuation, no spaces, no explanation. "
+    "Example: openrouter_logs_page"
+)
+
+
+def load_config():
+    if not CONFIG.exists():
+        raise SystemExit("No dayflow config found at " + str(CONFIG))
+    cfg = json.loads(CONFIG.read_text())
+    key = cfg.get("openrouter_api_key") or os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise SystemExit("No OpenRouter API key found")
+    return key, cfg.get("model", "google/gemma-4-31b-it")
+
+
+def resize_to_base64(path, max_dim=640, quality=80):
+    im = Image.open(path)
+    im = im.convert("RGB")
+    if max(im.size) > max_dim:
+        im.thumbnail((max_dim, max_dim))
+    from io import BytesIO
+    out = BytesIO()
+    im.save(out, format="JPEG", quality=quality)
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+def sanitize(caption):
+    c = str(caption if caption is not None else "screenshot").strip().lower()
+    c = re.sub(r"[^a-z0-9_-]+", "_", c)
+    c = re.sub(r"_+", "_", c).strip("_")
+    c = c[:40]
+    return c or "screenshot"
+
+
+def caption_one(api_key, model, path, attempts=3):
+    b64 = resize_to_base64(path)
+    for attempt in range(attempts):
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://dayflow.sh",
+                    "X-Title": "dayflow-screenshots",
+                },
+                json={
+                    "model": model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": PROMPT},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64}",
+                                "detail": "low"}},
+                        ],
+                    }],
+                    "max_tokens": 30,
+                },
+                timeout=120,
+            )
+            r.raise_for_status()
+            text = r.json()["choices"][0]["message"]["content"]
+            cap = sanitize(text)
+            if cap not in ("screenshot",) and not cap.isdigit():
+                return cap
+        except Exception as e:
+            print(f"  attempt {attempt + 1} failed for {path.name}: {e}",
+                  file=sys.stderr)
+        time.sleep(1 + attempt)
+    return "screenshot"
+
+
+def rebuild_index():
+    index_md = DST_DIR / "index.md"
+    lines = ["# Screenshots", ""]
+    for f in sorted(DST_DIR.glob("*.png")):
+        cap = f.stem
+        m = re.match(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_(.+)", f.stem)
+        if m:
+            cap = m.group(1)
+        lines.append(f"- [{f.name}]({f.name}) — {cap.replace('_', ' ')}")
+    index_md.write_text("\n".join(lines) + "\n")
+    return index_md
+
+
+def main():
+    api_key, model = load_config()
+    files = sorted(SRC_DIR.glob("screenshot-*.png"))
+    if not files:
+        print("No screenshot-*.png files found in", SRC_DIR)
+        rebuild_index()
+        return
+    DST_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Captioning {len(files)} screenshot(s) with {model} "
+          f"(one request per image)...")
+    for f in files:
+        caption = caption_one(api_key, model, f)
+        ts = f.stem.replace("screenshot-", "")
+        new_name = f"{ts}_{caption}.png"
+        dst = DST_DIR / new_name
+        n = 2
+        while dst.exists():
+            dst = DST_DIR / f"{ts}_{caption}_{n}.png"
+            n += 1
+        shutil.move(str(f), str(dst))
+        print(f"  {f.name} -> {dst.name}")
+
+    index_md = rebuild_index()
+    print(f"\nOrganized {len(files)} screenshot(s) into {DST_DIR}")
+    print(f"Index rebuilt at {index_md} "
+          f"({len(list(DST_DIR.glob('*.png')))} total files)")
+
+
+if __name__ == "__main__":
+    main()
